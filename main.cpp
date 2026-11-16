@@ -1,302 +1,224 @@
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <vector>
 #include <string>
-#include <random>
 #include <cmath>
-#include <sstream>
+#include <cstdlib>
+#include <thread>
 #include <tbb/tbb.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
 #include <oneapi/tbb/global_control.h>
 
-
-using namespace tbb;
 using namespace std;
 
+static const double G = 6.67e-11;   // Gravitational constant
+static const double THETA = 0.5;    // Barnes-Hut opening angle
+static const int MAX_DEPTH = 64;    // Stop subdividing (bodies at the same position)
+
 struct Point {
-public:
-    int x;
-    int y;
+    double x;
+    double y;
 
-    Point(double _x, double _y) {
-        x = _x;
-        y = _y;
-    }
-
-    Point() {
-        x = 0;
-        y = 0;
-    }
+    Point(double _x = 0, double _y = 0) : x(_x), y(_y) {}
 };
 
-struct Body{
-public:
+struct Body {
     Point pos;
-    double X, Y, Vx, Vy, M;
+    double Fx, Fy;   // Net force accumulated during the current step
+    double Vx, Vy, M;
     string S;
 
-    Body(Point _pos, double _X, double _Y, double _Vx, double _Vy, double _M, string _S){
-        pos = _pos;
-        X   = _X;
-        Y   = _Y;
-        Vx  = _Vx;
-        Vy  = _Vy;
-        M   = _M;
-        S   = _S;
-    }
-
-    Body(){
-        X   = 0;
-        Y   = 0;
-        Vx  = 0;
-        Vy  = 0;
-        M   = 0;
-        S   = "";
-    }
-
+    Body(Point _pos, double _Vx, double _Vy, double _M, string _S)
+        : pos(_pos), Fx(0), Fy(0), Vx(_Vx), Vy(_Vy), M(_M), S(_S) {}
 };
-
 
 class BHTree {
     Point topLeft;
     Point botRight;
+    int depth;
 
-    Body* b;
-
-    BHTree* NW;
-    BHTree* NE;
-    BHTree* SW;
-    BHTree* SE;
+    vector<Body*> bodies;      // Bodies stored in this node (only in leaves)
+    BHTree* child[4];          // NW, NE, SW, SE
 
     double totalMass;
     Point centerOfMass;
 
-public:
-
-    BHTree() {
-        topLeft = Point(0, 0);
-        botRight = Point(0, 0);
-        b = NULL;
-        NW = NULL;
-        NE = NULL;
-        SW = NULL;
-        SE = NULL;
+    bool isLeaf() const {
+        return !child[0] && !child[1] && !child[2] && !child[3];
     }
 
-    BHTree(Point topL, Point botR) {
-        topLeft  = topL;
-        botRight = botR;
-        b = NULL;
-        NW = NULL;
-        NE = NULL;
-        SW = NULL;
-        SE = NULL;
+    int quadrant(const Point& p) const {
+        double midX = (topLeft.x + botRight.x) / 2;
+        double midY = (topLeft.y + botRight.y) / 2;
+        bool west  = p.x <= midX;
+        bool north = p.y <= midY;
+        if (north) return west ? 0 : 1;
+        return west ? 2 : 3;
     }
 
-    Point getCenterOfMass() const {
-        return centerOfMass;
+    void insertIntoChild(Body* body) {
+        int q = quadrant(body->pos);
+        if (!child[q]) {
+            double midX = (topLeft.x + botRight.x) / 2;
+            double midY = (topLeft.y + botRight.y) / 2;
+            Point tl(q % 2 == 0 ? topLeft.x : midX, q < 2 ? topLeft.y : midY);
+            Point br(q % 2 == 0 ? midX : botRight.x, q < 2 ? midY : botRight.y);
+            child[q] = new BHTree(tl, br, depth + 1);
+        }
+        child[q]->insert(body);
     }
 
-    void insert(Body*);
-    bool length(Point);
-    void calculateCenterOfMass();
-    void netForce(Body*);
-    void newPosition(Body*);
-    void computeNetForcesParallel(vector<Body*>&);
-
-};
-
-// Insert node in the BHTreetree
-void BHTree::insert(Body* body) {
-
-    if(body == NULL){
-        return;
-    }
-
-    if(!length(body->pos)){
-        return;
-    }
-
-    if(abs(topLeft.x - botRight.x) <=1
-       && abs(topLeft.y - botRight.y) <=1) {
-            if(b == NULL){
-                b = body;
-            }
+    static void addForce(Body* body, const Point& from, double mass) {
+        double dx = from.x - body->pos.x;
+        double dy = from.y - body->pos.y;
+        double r = sqrt(dx * dx + dy * dy);
+        if (r == 0) {
             return;
+        }
+        double F = (G * mass * body->M) / (r * r);
+        body->Fx += F * (dx / r);
+        body->Fy += F * (dy / r);
     }
 
-    if ((topLeft.x + botRight.x) / 2 >= body->pos.x) {
-        // Indicates topLeftTree
-        if ((topLeft.y + botRight.y) / 2 >= body->pos.y) {
-            if (NW == NULL)
-                NW = new BHTree(
-                    Point(topLeft.x, topLeft.y),
-                    Point((topLeft.x + botRight.x) / 2,
-                          (topLeft.y + botRight.y) / 2));
-            NW->insert(body);
-        }
- 
-        // Indicates botLeftTree
-        else {
-            if (SW == NULL)
-                SW = new BHTree(
-                    Point(topLeft.x,
-                          (topLeft.y + botRight.y) / 2),
-                    Point((topLeft.x + botRight.x) / 2,
-                          botRight.y));
-            SW->insert(body);
-        }
+public:
+    BHTree(Point topL, Point botR, int _depth = 0)
+        : topLeft(topL), botRight(botR), depth(_depth), totalMass(0) {
+        child[0] = child[1] = child[2] = child[3] = nullptr;
     }
-    else {
-        // Indicates topRightTree
-        if ((topLeft.y + botRight.y) / 2 >= body->pos.y) {
-            if (NE == NULL)
-                NE = new BHTree(
-                    Point((topLeft.x + botRight.x) / 2,
-                          topLeft.y),
-                    Point(botRight.x,
-                          (topLeft.y + botRight.y) / 2));
-            NE->insert(body);
-        }
- 
-        // Indicates botRightTree
-        else {
-            if (SE == NULL)
-                SE = new BHTree(
-                    Point((topLeft.x + botRight.x) / 2,
-                          (topLeft.y + botRight.y) / 2),
-                    Point(botRight.x, botRight.y));
-            SE->insert(body);
+
+    ~BHTree() {
+        for (BHTree* c : child) {
+            delete c;
         }
     }
 
-}
+    // The tree owns raw pointers to its children, so it must not be copied
+    BHTree(const BHTree&) = delete;
+    BHTree& operator=(const BHTree&) = delete;
 
-// Check if current BHTreetree contains the point
-bool BHTree::length(Point p)
-{
-    return (p.x >= topLeft.x && p.x <= botRight.x
-            && p.y >= topLeft.y && p.y <= botRight.y);
-}
+    // Check if the region of this node contains the point
+    bool contains(const Point& p) const {
+        return p.x >= topLeft.x && p.x <= botRight.x
+            && p.y >= topLeft.y && p.y <= botRight.y;
+    }
 
-void BHTree::calculateCenterOfMass() {
-    // if its a leaf
-    if (NW == NULL && NE == NULL && SW == NULL && SE == NULL) {
-        if (b != NULL) {
-            totalMass = b->M;
-            centerOfMass = b->pos;
+    // Insert a body. Bodies outside the universe are ignored.
+    void insert(Body* body) {
+        if (body == nullptr || !contains(body->pos)) {
+            return;
+        }
+
+        if (isLeaf()) {
+            if (bodies.empty() || depth >= MAX_DEPTH) {
+                bodies.push_back(body);
+                return;
+            }
+            // Leaf already has a body: split it and push the old body down
+            vector<Body*> old;
+            old.swap(bodies);
+            for (Body* b : old) {
+                insertIntoChild(b);
+            }
+        }
+        insertIntoChild(body);
+    }
+
+    // Compute total mass and center of mass of every node (children in parallel)
+    void calculateCenterOfMass() {
+        totalMass = 0;
+        double cx = 0, cy = 0;
+
+        if (isLeaf()) {
+            for (Body* b : bodies) {
+                totalMass += b->M;
+                cx += b->M * b->pos.x;
+                cy += b->M * b->pos.y;
+            }
         } else {
-            totalMass = 0;
+            tbb::parallel_invoke(
+                [this]() { if (child[0]) child[0]->calculateCenterOfMass(); },
+                [this]() { if (child[1]) child[1]->calculateCenterOfMass(); },
+                [this]() { if (child[2]) child[2]->calculateCenterOfMass(); },
+                [this]() { if (child[3]) child[3]->calculateCenterOfMass(); }
+            );
+            for (BHTree* c : child) {
+                if (c) {
+                    totalMass += c->totalMass;
+                    cx += c->totalMass * c->centerOfMass.x;
+                    cy += c->totalMass * c->centerOfMass.y;
+                }
+            }
+        }
+
+        if (totalMass > 0) {
+            centerOfMass = Point(cx / totalMass, cy / totalMass);
+        } else {
             centerOfMass = Point((topLeft.x + botRight.x) / 2, (topLeft.y + botRight.y) / 2);
         }
-        return;
     }
 
-    parallel_invoke(
-        [this]() { if (NW != NULL) NW->calculateCenterOfMass(); },
-        [this]() { if (NE != NULL) NE->calculateCenterOfMass(); },
-        [this]() { if (SW != NULL) SW->calculateCenterOfMass(); },
-        [this]() { if (SE != NULL) SE->calculateCenterOfMass(); }
-    );
+    // Accumulate the force that this node exerts on the body
+    void netForce(Body* body) const {
+        if (totalMass == 0) {
+            return;
+        }
 
-    // calculate total mass and the center of mass
-    totalMass = 0;
-    centerOfMass = Point(0, 0);
-    if (NW != NULL) {
-        totalMass += NW->totalMass;
-        centerOfMass.x += NW->totalMass * NW->centerOfMass.x;
-        centerOfMass.y += NW->totalMass * NW->centerOfMass.y;
+        if (isLeaf()) {
+            for (Body* other : bodies) {
+                if (other != body) {
+                    addForce(body, other->pos, other->M);
+                }
+            }
+            return;
+        }
+
+        double dx = centerOfMass.x - body->pos.x;
+        double dy = centerOfMass.y - body->pos.y;
+        double r = sqrt(dx * dx + dy * dy);
+        double width = botRight.x - topLeft.x;
+
+        // Far enough away (and not containing the body): treat the node as one mass
+        if (!contains(body->pos) && r > 0 && width / r < THETA) {
+            addForce(body, centerOfMass, totalMass);
+        } else {
+            for (BHTree* c : child) {
+                if (c) c->netForce(body);
+            }
+        }
     }
-    if (NE != NULL) {
-        totalMass += NE->totalMass;
-        centerOfMass.x += NE->totalMass * NE->centerOfMass.x;
-        centerOfMass.y += NE->totalMass * NE->centerOfMass.y;
-    }
-    if (SW != NULL) {
-        totalMass += SW->totalMass;
-        centerOfMass.x += SW->totalMass * SW->centerOfMass.x;
-        centerOfMass.y += SW->totalMass * SW->centerOfMass.y;
-    }
-    if (SE != NULL) {
-        totalMass += SE->totalMass;
-        centerOfMass.x += SE->totalMass * SE->centerOfMass.x;
-        centerOfMass.y += SE->totalMass * SE->centerOfMass.y;
-    }
+};
 
-    if (totalMass > 0) {
-        centerOfMass.x /= totalMass;
-        centerOfMass.y /= totalMass;
-    }
-}
+// Update velocity and position from the accumulated force, then reset it
+static void newPosition(Body& body, double dt) {
+    body.Vx += dt * body.Fx / body.M;
+    body.Vy += dt * body.Fy / body.M;
 
-void BHTree::netForce(Body* body) {
-    // Check if the current node can't subdivide further or contains the body
-    if (!length(body->pos) || (abs(topLeft.x - botRight.x) <= 1 && abs(topLeft.y - botRight.y) <= 1) || b == body) {
-        return;
-    }
+    body.pos.x += dt * body.Vx;
+    body.pos.y += dt * body.Vy;
 
-    // Calculate the distance between the center of mass of this node and the body
-    double dx = centerOfMass.x - body->pos.x;
-    double dy = centerOfMass.y - body->pos.y;
-    double r = sqrt(dx * dx + dy * dy);
-
-    // If the distance is greater than the size of the smaller region containing the body,
-    // and the body is not contained in this node, calculate the force exerted on the body
-    if (r > min(abs(topLeft.x - botRight.x), abs(topLeft.y - botRight.y))) {
-        // Calculate the gravitational force using Newton's law of universal gravitation
-        double F = (6.67e-11 * totalMass * body->M) / (r * r);
-
-        // Calculate the force components in x and y directions
-        double Fx = F * (dx / r);
-        double Fy = F * (dy / r);
-
-        // Update the net force exerted on the body
-        body->X += Fx;
-        body->Y += Fy;
-    }
-    // If the body is contained within this node or the distance is smaller than the size of the body,
-    // recursively calculate the forces exerted by the children nodes
-    else {
-        if (NW != NULL) NW->netForce(body);
-        if (NE != NULL) NE->netForce(body);
-        if (SW != NULL) SW->netForce(body);
-        if (SE != NULL) SE->netForce(body);
-    }
-}
-
-void BHTree::newPosition(Body* body) {
-    // Update velocity using the calculated net force
-    body->Vx += body->X / body->M;
-    body->Vy += body->Y / body->M;
-
-    // Update position using the updated velocity
-    body->pos.x += body->Vx;
-    body->pos.y += body->Vy;
-
-    // Reset net force for the next iteration
-    body->X = 0;
-    body->Y = 0;
-}
-
-void BHTree::computeNetForcesParallel(vector<Body*>& bodies) {
-    parallel_for_each(bodies.begin(), bodies.end(), [&](Body* body) {
-        netForce(body);
-    });
+    body.Fx = 0;
+    body.Fy = 0;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cout << "Usage: " << argv[0] << " input_file.txt Iter" << endl;
+    if (argc < 3 || argc > 5) {
+        cout << "Usage: " << argv[0] << " input_file.txt iterations [threads] [dt]" << endl;
         return 1;
     }
-    
-    size_t numThreads = 2;
-    oneapi::tbb::global_control gc(oneapi::tbb::global_control::max_allowed_parallelism, numThreads);
 
-    // Read input file name from command line arguments
     string inputFileName = argv[1];
     int numIterations = atoi(argv[2]);
+    size_t numThreads = argc > 3 ? (size_t)atoi(argv[3]) : max(1u, thread::hardware_concurrency());
+    double dt = argc > 4 ? atof(argv[4]) : 1.0;
+
+    if (numIterations < 0 || numThreads < 1 || dt <= 0) {
+        cerr << "Error: iterations must be >= 0, threads >= 1 and dt > 0." << endl;
+        return 1;
+    }
+
+    oneapi::tbb::global_control gc(oneapi::tbb::global_control::max_allowed_parallelism, numThreads);
 
     // Open input file
     ifstream inputFile(inputFileName);
@@ -307,75 +229,66 @@ int main(int argc, char* argv[]) {
 
     // Read simulation parameters from the input file
     int N;      // Number of bodies
-    double R;   // Size of the universe
-    inputFile >> N >> R;
+    double R;   // Radius of the universe (positions are in [-R, R])
+    if (!(inputFile >> N >> R)) {
+        cerr << "Error: Invalid input file header." << endl;
+        return 1;
+    }
 
-    // Read body data from the input file and store in a vector
+    // Read body data from the input file
     vector<Body> bodies;
+    bodies.reserve(N);
     for (int i = 0; i < N; ++i) {
         double X, Y, Vx, Vy, M;
         string S;
-        inputFile >> X >> Y >> Vx >> Vy >> M >> S;
-        bodies.push_back(Body(Point(X, Y), X, Y, Vx, Vy, M, S));
+        if (!(inputFile >> X >> Y >> Vx >> Vy >> M >> S)) {
+            cerr << "Error: Expected " << N << " bodies but could only read " << i << "." << endl;
+            return 1;
+        }
+        bodies.push_back(Body(Point(X, Y), Vx, Vy, M, S));
     }
-
-    // Close input file
     inputFile.close();
-
-    // Use the same bounds as the tree that is rebuilt every iteration
-    BHTree bhtree(Point(0, 0), Point(100, 100));
-
-    // Create a vector of pointers to Body objects
-    vector<Body*> bodyPointers;
-    for (auto& body : bodies) {
-        bodyPointers.push_back(&body);
-    }
 
     // Perform simulation iterations
     for (int iter = 0; iter < numIterations; ++iter) {
-        // Construct the Barnes-Hut tree. Insertion is sequential because
-        // insert() modifies shared nodes and is not thread-safe.
-        for (auto* body : bodyPointers) {
-            bhtree.insert(body);
+        // Build a new tree for the current positions. Insertion is sequential
+        // because insert() modifies shared nodes and is not thread-safe.
+        BHTree tree(Point(-R, -R), Point(R, R));
+        for (Body& body : bodies) {
+            tree.insert(&body);
         }
 
-        // Compute total mass / center of mass of every node (parallel_invoke inside)
-        bhtree.calculateCenterOfMass();
+        tree.calculateCenterOfMass();
 
-        // Calculate forces using Barnes-Hut algorithm in parallel
-        bhtree.computeNetForcesParallel(bodyPointers);
+        // Calculate forces in parallel (each task only writes its own body)
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, bodies.size()), [&](const tbb::blocked_range<size_t>& range) {
+            for (size_t i = range.begin(); i != range.end(); ++i) {
+                tree.netForce(&bodies[i]);
+            }
+        });
 
         // Update positions and velocities in parallel
         tbb::parallel_for(tbb::blocked_range<size_t>(0, bodies.size()), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t i = range.begin(); i != range.end(); ++i) {
-                bhtree.newPosition(&bodies[i]);
+                newPosition(bodies[i], dt);
             }
         });
-
-        // Clear the Barnes-Hut tree for the next iteration
-        // If the tree is not cleared, the new bodies' positions
-        // won't be correctly inserted into the tree
-        bhtree = BHTree(Point(0, 0), Point(100, 100));
     }
 
-
-    // Open output file
+    // Write output data in the same format as the input
     ofstream outputFile("output.txt");
     if (!outputFile) {
         cerr << "Error: Could not open output file." << endl;
         return 1;
     }
 
-    // Write output data to the output file
     outputFile << N << endl;
-    outputFile << R << endl;
-    for (const auto& body : bodies) {
-        outputFile << body.pos.x << " " << body.pos.y << " " << body.Vx << " " << body.Vy << " " << body.M << " " << body.S << endl;
+    outputFile << scientific << setprecision(4) << R << endl;
+    for (const Body& body : bodies) {
+        outputFile << body.pos.x << " " << body.pos.y << " " << body.Vx << " " << body.Vy << " "
+                   << body.M << " " << body.S << endl;
     }
-
-    // Close output file
     outputFile.close();
 
     return 0;
 }
-

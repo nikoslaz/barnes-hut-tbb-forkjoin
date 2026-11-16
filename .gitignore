@@ -1,0 +1,5 @@
+# Build outputs
+*.class
+*.o
+barnes_hut
+output.txt
