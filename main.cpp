@@ -287,7 +287,7 @@ void BHTree::computeNetForcesParallel(vector<Body*>& bodies) {
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        cout << "Usage: " << argv[0] << " input_file.txt" << "Iter" <<endl;
+        cout << "Usage: " << argv[0] << " input_file.txt Iter" << endl;
         return 1;
     }
     
@@ -322,7 +322,8 @@ int main(int argc, char* argv[]) {
     // Close input file
     inputFile.close();
 
-    BHTree bhtree;
+    // Use the same bounds as the tree that is rebuilt every iteration
+    BHTree bhtree(Point(0, 0), Point(100, 100));
 
     // Create a vector of pointers to Body objects
     vector<Body*> bodyPointers;
@@ -330,14 +331,16 @@ int main(int argc, char* argv[]) {
         bodyPointers.push_back(&body);
     }
 
-    // Perform simulation iterations 
+    // Perform simulation iterations
     for (int iter = 0; iter < numIterations; ++iter) {
-        // Construct the Barnes-Hut tree in parallel
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, bodies.size()), [&](const tbb::blocked_range<size_t>& range) {
-            for (size_t i = range.begin(); i != range.end(); ++i) {
-                bhtree.insert(&bodies[i]);
-            }
-        });
+        // Construct the Barnes-Hut tree. Insertion is sequential because
+        // insert() modifies shared nodes and is not thread-safe.
+        for (auto* body : bodyPointers) {
+            bhtree.insert(body);
+        }
+
+        // Compute total mass / center of mass of every node (parallel_invoke inside)
+        bhtree.calculateCenterOfMass();
 
         // Calculate forces using Barnes-Hut algorithm in parallel
         bhtree.computeNetForcesParallel(bodyPointers);

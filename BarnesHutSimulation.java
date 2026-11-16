@@ -286,6 +286,9 @@ public class BarnesHutSimulation {
                 for (int iter = 0; iter < numIterations; ++iter) {
                     BHTree bhtree = new BHTree(new Point(0, 0), new Point(100, 100)); // Create a new instance
                     // Construct the Barnes-Hut tree
+                    for (Body body : bodies) {
+                        bhtree.insert(body);
+                    }
                     bhtree.calculateCenterOfMassParallel(); // Use the parallel version
 
                     // Calculate forces using Barnes-Hut algorithm in parallel
